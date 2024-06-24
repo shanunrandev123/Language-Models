@@ -300,7 +300,7 @@ class Head(nn.Module):
     
 
 
-model = BigramModel(vocab_size)
+model = BigramModel()
 
 m = model.to(device)
 
