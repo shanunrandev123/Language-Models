@@ -7,11 +7,11 @@ import numpy as np
 batch_size = 32 # independent sequences in parallel
 block_size = 8 # max context length to generate predictions
 
-max_iter = 2000
+max_iter = 4000
 
-eval_interval = 300
+eval_interval = 400
 
-learning_rate = 1e-2
+learning_rate = 1e-3
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -105,6 +105,56 @@ def estimate_loss():
     model.train()
     return out
 
+
+
+class MultiHeadAttention(nn.Module):
+    
+    """
+    Multiple heads of attention in parallel
+    """
+    
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim = -1)
+    
+    
+class FeedForward(nn.Module):
+    
+    def __init__(self,n_embd):
+        super().__init__()
+        
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.GELU()
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+    
+    
+
+class Block(nn.Module):
+    
+    def __init__(self, n_embd, num_heads):
+        super().__init__()
+        
+        head_size = n_embd // num_heads
+        
+        self.sa = MultiHeadAttention(num_heads, head_size)
+        
+        self.ffwd = FeedForward(n_embd)
+        
+    def forward(self, x):
+        
+        x = self.sa(x)
+        
+        x = self.ffwd(x)
+        
+        return x
+    
     
     
 #(B,T,C) - Batch, time and channel - here batch is batch size which is 4, 
@@ -115,12 +165,19 @@ def estimate_loss():
 
 class BigramModel(nn.Module):
     
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
-        self.vocab_size = vocab_size
         
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        
+        self.blocks = nn.Sequential(Block(n_embd, num_heads),
+                                    Block(n_embd, num_heads),
+                                    Block(n_embd, num_heads),
+                                    )
+        
+        # self.sa_heads = MultiHeadAttention(4, n_embd // 4)
+        # self.ffd = FeedForward(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
     
     def forward(self, idx, targets = None):
@@ -130,8 +187,13 @@ class BigramModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B, T, C)
         pos_emb = self.position_embedding_table(torch.arange(T, device = device)) # (T, C)
         x = tok_emb + pos_emb
-        token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
-        logits = self.lm_head(token_embeddings) # (B, T, vocab_size)
+        # x = self.sa_heads(x)
+        # x = self.ffd(x)
+        
+        x = self.blocks(x)
+        
+        # token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
+        logits = self.lm_head(x) # (B, T, vocab_size)
         
         if targets is None:
             loss = None
@@ -146,35 +208,55 @@ class BigramModel(nn.Module):
         return logits, loss
     
     
-    def generate(self, idx, max_tokens):
+    # def generate(self, idx, max_tokens):
         
-        for _ in range(max_tokens):
+    #     for _ in range(max_tokens):
             
-            #self(idx) is used to call the forward function
+    #         #self(idx) is used to call the forward function
             
             
                 
 
-            logits, loss = self(idx)
+    #         logits, loss = self(idx)
 
 
-            #focus only on last time stamp
+    #         #focus only on last time stamp
+    #         logits = logits[:, -1, :]
+
+    #         #apply softmax to get probs
+
+    #         probs = F.softmax(logits, dim = 1)
+
+    #         #sample the next token from the batch
+
+    #         idx_next = torch.multinomial(probs, num_samples = 1)
+
+    #         idx = torch.cat((idx, idx_next), dim = 1)
+            
+    #     return idx
+    
+    
+    def generate(self, idx, max_tokens):
+        
+        for _ in range(max_tokens):
+            
+            idx_cond = idx[:, -block_size:]
+            
+            logits, loss = self(idx_cond)
+            
             logits = logits[:, -1, :]
-
-            #apply softmax to get probs
-
-            probs = F.softmax(logits, dim = 1)
-
-            #sample the next token from the batch
-
+            
+            probs = F.softmax(logits, dim = -1)
+            
             idx_next = torch.multinomial(probs, num_samples = 1)
-
+            
             idx = torch.cat((idx, idx_next), dim = 1)
             
-        return idx
+        return idx    
     
-    
-    
+#self attention - queires, keys and values are coming from the same input x 
+# cross attention - queries come from x, keys and values come from y
+
     
     
 class Head(nn.Module):
@@ -189,9 +271,34 @@ class Head(nn.Module):
         
         self.value = nn.Linear(n_embd, head_size, bias=False)
         
+        #not a parameter but a buffer
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         
     
+    def forward(self, x):
+        B, T, C = x.shape
+        
+        k = self.key(x)  #(B, T, C)
+        
+        q = self.query(x) #(B, T, C)
+        
+        #computing attention scores(affinities)
+        
+        wei = q @ k.transpose(-2,-1) * C ** (-0.5) #(B, T, C) @ (B, C, T) = (B, T, T)
+        
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        
+        wei = F.softmax(wei, dim = -1) #(B, T, T) #softmax along the last dimension
+        
+        v = self.value(x) #(B, T, C)
+        
+        out = wei @ v #(B, T, T) @ (B, T, C) = (B, T, C)
+        
+        return out
     
+    
+    
+
 
 model = BigramModel(vocab_size)
 
@@ -219,9 +326,11 @@ for iter in range(max_iter):
 
 idx = torch.zeros((1,1), dtype = torch.long)
     
-idx1 = m.generate(idx, max_tokens=100)[0].tolist()
+idx1 = m.generate(idx, max_tokens=100).tolist()
 
-print(''.join(itos[i] for i in idx1))
+print(idx1)
+
+print(''.join(itos[i] for i in idx1[0]))
     
         
     
